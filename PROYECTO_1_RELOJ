@@ -1,0 +1,1251 @@
+//Universidad del Valle de Guatemala
+//Programacion de Microcontroladores
+//Ciclo 1 2026
+//Proyecto_1_Reloj.asm
+//Hardware: ATMega328P
+
+//Creado: 2/23/2026
+//Autor: Mynor Eduardo Orantes Gonzalez
+//Carné: 22259
+
+.INCLUDE "M328PDEF.INC"  
+
+;=========================
+; ESTADOS (Máquina de estados principal)
+;=========================
+.EQU STATE_TIME = 0      ; Constante para el Modo Reloj (0)
+.EQU STATE_DATE = 1      ; Constante para el Modo Fecha (1)
+.EQU STATE_ALARM = 2     ; Constante para el Modo Alarma (2)
+
+;=========================
+; VARIABLES (Memoria RAM)
+;=========================
+.DSEG                    ; Inicia el segmento de datos (SRAM)
+HORAS:      .BYTE 1      ; Guarda las horas del reloj (0-23)
+MINUTOS:    .BYTE 1      ; Guarda los minutos del reloj (0-59)
+SEGUNDOS:   .BYTE 1      ; Guarda los segundos del reloj (0-59)
+MS_L:       .BYTE 1      ; Byte bajo del contador de milisegundos
+MS_H:       .BYTE 1      ; Byte alto del contador de milisegundos
+HALF_L:     .BYTE 1      ; Byte bajo del contador para el medio segundo (parpadeo)
+HALF_H:     .BYTE 1      ; Byte alto del contador para el medio segundo
+COLON_FLAG: .BYTE 1      ; Bandera (0 o 1) para encender/apagar los dos puntos (:)
+STATE:      .BYTE 1      ; Guarda el estado actual (Reloj, Fecha o Alarma)
+
+DIA:        .BYTE 1      ; Guarda el día actual del calendario (1-31)
+MES:        .BYTE 1      ; Guarda el mes actual (1-12)
+
+BTN_LOCK:   .BYTE 1      ; Bandera de bloqueo para el antirrebote (1=bloqueado)
+BTN_TIMER:  .BYTE 1      ; Temporizador para medir el tiempo del antirrebote
+
+ALARM_H:    .BYTE 1      ; Hora configurada para la alarma
+ALARM_M:    .BYTE 1      ; Minutos configurados para la alarma
+ALARM_ON:   .BYTE 1      ; Bandera que indica si la alarma está sonando ahora (1=sonando)
+ALARM_LAST_MINUTE: .BYTE 1 ; Guarda el minuto en el que sonó para no repetir el pitido
+
+BTN_LAST:   .BYTE 1      ; (Variable sin uso actual, reservada para estados previos)
+
+; Variables para configuración (Modo Edición)
+CONFIG_MODE:  .BYTE 1    ; 0 = Reloj corriendo normal, 1 = Modo edición activo
+CONFIG_DIGIT: .BYTE 1    ; Indica qué dígito parpadea: 0=D_Hor, 1=U_Hor, 2=D_Min, 3=U_Min
+
+; Variables aisladas para modificar dígitos sin alterar la hora real mientras se edita
+CFG_D_HOR:    .BYTE 1    ; Decenas de Hora / Día
+CFG_U_HOR:    .BYTE 1    ; Unidades de Hora / Día
+CFG_D_MIN:    .BYTE 1    ; Decenas de Minuto / Mes
+CFG_U_MIN:    .BYTE 1    ; Unidades de Minuto / Mes
+
+; Variables para mantener presionado D2 (Long Press)
+HOLD_FLAG:    .BYTE 1    ; Indica si el cronómetro de pulsación larga está corriendo
+HOLD_L:       .BYTE 1    ; Byte bajo del cronómetro de botón presionado
+HOLD_H:       .BYTE 1    ; Byte alto del cronómetro de botón presionado
+
+;=========================
+; CÓDIGO (Memoria Flash ROM)
+;=========================
+.CSEG                    ; Inicia el segmento de código
+.ORG 0x0000              ; Vector de Reset (Inicio del programa)
+RJMP START               ; Salta a la rutina de inicialización
+
+.ORG 0x000A              ; Vector de interrupción Pin Change 2 (Pines D0 a D7)
+RJMP ISR_PCINT2          ; Salta a la rutina que lee los botones
+
+.ORG 0x001C              ; Vector de interrupción del Timer0 Compare Match A
+RJMP ISR_TIMER0          ; Salta a la rutina del temporizador base
+
+;=========================
+; START (Inicialización del Microcontrolador)
+;=========================
+START:
+; Configuración de la Pila (Stack Pointer) necesaria para interrupciones y llamadas (RCALL)
+LDI R16,LOW(RAMEND)
+OUT SPL,R16
+LDI R16,HIGH(RAMEND)
+OUT SPH,R16
+
+CLR R1                   ; R1 se mantiene en 0 para usarlo al limpiar registros tras multiplicar
+
+; Inicializar variables de tiempo a 0 (00:00:00)
+CLR R16
+STS HORAS,R16
+STS MINUTOS,R16
+STS SEGUNDOS,R16
+STS MS_L,R16
+STS MS_H,R16
+STS HALF_L,R16
+STS HALF_H,R16
+STS COLON_FLAG,R16
+STS STATE,R16            ; Inicia en STATE_TIME (0)
+STS BTN_LOCK,R16
+STS BTN_TIMER,R16
+STS CONFIG_MODE,R16
+STS CONFIG_DIGIT,R16
+STS HOLD_FLAG,R16
+STS HOLD_L,R16
+STS HOLD_H,R16
+
+; Inicializar fecha (Ejemplo: 27/02)
+LDI R16,27
+STS DIA,R16
+LDI R16,2
+STS MES,R16
+
+; Configurar puertos I/O (Entradas y Salidas)
+LDI R16,0b00111111       ; Pines PB0 a PB5 como salidas (Segmentos A-F del display)
+OUT DDRB,R16
+
+LDI R16,(1<<PD7)|(1<<PD6); Pines PD7 (Segmento G) y PD6 (LED dos puntos) como salidas
+OUT DDRD,R16
+
+LDI R16, 0XFF
+STS BTN_LAST, R16
+
+LDI R16,0x0F             ; Pines PC0 a PC3 como salidas (Transistores comunes de los displays)
+OUT DDRC,R16
+CLR R16
+OUT PORTC,R16            ; Apagar todos los comunes inicialmente
+
+; Inicializar variables de la alarma (Ejemplo: 03:30)
+LDI R16, 03
+STS ALARM_H, R16
+LDI R16, 30
+STS ALARM_M, R16
+CLR R16
+STS ALARM_ON, R16
+STS ALARM_LAST_MINUTE, R16
+
+; Configurar Buzzer
+SBI DDRD, PD5            ; Configurar PD5 como salida (Buzzer)
+CBI PORTD, PD5           ; Asegurar que el buzzer inicie apagado
+
+; Configurar Botones
+CBI DDRD,PD2             ; Configurar PD2 como entrada (Botón UP/HOLD)
+CBI DDRD,PD3             ; Configurar PD3 como entrada (Botón DOWN)
+CBI DDRD,PD4             ; Configurar PD4 como entrada (Botón MODE/NEXT)
+
+SBI PORTD,PD2            ; Activar resistencia Pull-Up interna en PD2
+SBI PORTD,PD3            ; Activar resistencia Pull-Up interna en PD3
+SBI PORTD,PD4            ; Activar resistencia Pull-Up interna en PD4
+
+; Configurar Interrupciones de Botones (Pin Change Interrupt)
+LDI R16,(1<<PCIE2)       ; Habilitar banco de interrupciones PCINT2
+STS PCICR,R16
+LDI R16,(1<<PCINT18)|(1<<PCINT19)|(1<<PCINT20) ; Escuchar cambios en pines PD2, PD3 y PD4
+STS PCMSK2,R16
+
+; Configurar TIMER0 (Generador de base de tiempo)
+LDI R16,(1<<WGM01)       ; Modo CTC (Clear Timer on Compare Match)
+OUT TCCR0A,R16
+LDI R16,(1<<CS01)|(1<<CS00) ; Prescaler en 64 (El timer cuenta a 250kHz con cristal de 16MHz)
+OUT TCCR0B,R16
+LDI R16,249              ; Tope del contador (250 ticks = 1 milisegundo exacto)
+OUT OCR0A,R16
+LDI R16,(1<<OCIE0A)      ; Habilitar interrupción cuando el timer llegue al tope
+STS TIMSK0,R16
+
+SEI                      ; Habilitar interrupciones globales de todo el microcontrolador
+
+; Configurar LEDs indicadores de estado
+SBI DDRC,PC4             ; Salida: LED indicador de HORA
+SBI DDRC,PC5             ; Salida: LED indicador de FECHA
+SBI DDRD,PD1             ; Salida: LED indicador de ALARMA
+CBI PORTC,PC4            ; Apagar LEDs al iniciar
+CBI PORTC,PC5
+CBI PORTD,PD1
+
+;=========================
+; LOOP PRINCIPAL (Bucle infinito)
+;=========================
+LOOP:
+
+; 1. Control del LED de los dos puntos (:)
+LDS R17, CONFIG_MODE
+CPI R17, 1
+BREQ COLON_ON_CFG        ; Si está en modo configuración, dejarlos encendidos fijos
+
+LDS R16,COLON_FLAG       ; Si no, leer la bandera intermitente del timer
+CPI R16,1
+BRNE COLON_OFF
+COLON_ON_CFG:
+SBI PORTD,PD6            ; Encender dos puntos
+RJMP COLON_DONE
+COLON_OFF:
+CBI PORTD,PD6            ; Apagar dos puntos
+COLON_DONE:
+
+;-------------------------
+; 2. Control de LEDs Indicadores de Estado (Hora, Fecha, Alarma)
+;-------------------------
+LDS R17,STATE
+CBI PORTC,PC4            ; Apagar los tres LEDs por precaución
+CBI PORTC,PC5
+CBI PORTD,PD1
+
+CPI R17, STATE_TIME 
+BREQ LED_TIME            ; Si el estado es 0, salta a encender LED Hora
+CPI R17, STATE_DATE
+BREQ LED_DATE            ; Si el estado es 1, salta a encender LED Fecha
+CPI R17, STATE_ALARM
+BREQ LED_ALARM           ; Si el estado es 2, salta a encender LED Alarma
+RJMP LED_DONE
+
+LED_TIME:
+SBI PORTC, PC4           ; Enciende LED de Hora
+RJMP LED_DONE
+LED_DATE:
+SBI PORTC, PC5           ; Enciende LED de Fecha
+RJMP LED_DONE
+LED_ALARM:
+SBI PORTD, PD1           ; Enciende LED de Alarma
+LED_DONE:
+
+;-------------------------
+; 3. Control del Buzzer
+;-------------------------
+LDS R16, ALARM_ON        ; Revisa si la bandera de alarma disparada es 1
+CPI R16,1
+BRNE BUZZER_OFF
+SBI PORTD,PD5            ; Si es 1, manda energía al pin del Buzzer
+RJMP BUZZER_DONE
+BUZZER_OFF:
+CBI PORTD,PD5            ; Si es 0, apaga el Buzzer
+BUZZER_DONE: 
+
+;-------------------------
+; 4. Modo de Pantalla (Elegir qué datos enviar a los Displays)
+;-------------------------
+LDS R17, CONFIG_MODE
+CPI R17, 1
+BREQ DISPLAY_CONFIG_ONLY ; Si está configurando, va a una rutina especial para mostrar 1 solo dígito
+
+LDS R17,STATE            ; Si no, lee el estado normal
+CPI R17,STATE_TIME
+BREQ SHOW_TIME           ; Carga datos de Hora
+CPI R17,STATE_DATE
+BREQ SHOW_DATE           ; Carga datos de Fecha
+CPI R17,STATE_ALARM
+BREQ SHOW_ALARM          ; Carga datos de Alarma
+
+SHOW_TIME:
+; Separa las Horas en decenas (R20) y unidades (R21)
+LDS R16,HORAS
+RCALL DIV10
+MOV R20,R18
+MOV R21,R19
+; Separa los Minutos en decenas (R22) y unidades (R23)
+LDS R16,MINUTOS
+RCALL DIV10
+MOV R22,R18
+MOV R23,R19
+RJMP DISPLAY             ; Salta a encender los displays
+
+SHOW_DATE:
+LDS R16,DIA              ; Carga el Día y lo separa en decenas y unidades
+RCALL DIV10
+MOV R20,R18
+MOV R21,R19
+LDS R16,MES              ; Carga el Mes y lo separa en decenas y unidades
+RCALL DIV10
+MOV R22,R18
+MOV R23,R19
+RJMP DISPLAY
+
+SHOW_ALARM:
+LDS R16,ALARM_H          ; Carga la Hora de alarma y la separa
+RCALL DIV10
+MOV R20,R18
+MOV R21,R19
+LDS R16,ALARM_M          ; Carga los Minutos de alarma y los separa
+RCALL DIV10
+MOV R22,R18
+MOV R23,R19
+RJMP DISPLAY
+
+;=========================
+; DISPLAY MODO CONFIG (Muestra solo 1 dígito parpadeando)
+;=========================
+DISPLAY_CONFIG_ONLY:
+LDS R17, CONFIG_DIGIT    ; Revisa qué dígito se está editando (0, 1, 2 o 3)
+
+RCALL APAGAR             ; Apaga todo para evitar "ghosting"
+CPI R17, 0               ; ¿Es el dígito 0 (Decenas de hora)?
+BRNE CFG_SKIP_0
+LDS R16, CFG_D_HOR       ; Carga el valor aislado de edición
+RCALL LOAD_DIGIT         ; Decodifica a 7 segmentos
+SBI PORTC, PC0           ; Enciende el display de la extrema izquierda
+CFG_SKIP_0:
+RCALL SMALL_DELAY        ; Pequeña pausa para que el LED brille
+
+RCALL APAGAR
+CPI R17, 1               ; ¿Es el dígito 1 (Unidades de hora)?
+BRNE CFG_SKIP_1
+LDS R16, CFG_U_HOR
+RCALL LOAD_DIGIT
+SBI PORTC, PC1
+CFG_SKIP_1:
+RCALL SMALL_DELAY
+
+RCALL APAGAR
+CPI R17, 2               ; ¿Es el dígito 2 (Decenas de minuto)?
+BRNE CFG_SKIP_2
+LDS R16, CFG_D_MIN
+RCALL LOAD_DIGIT
+SBI PORTC, PC2
+CFG_SKIP_2:
+RCALL SMALL_DELAY
+
+RCALL APAGAR
+CPI R17, 3               ; ¿Es el dígito 3 (Unidades de minuto)?
+BRNE CFG_SKIP_3
+LDS R16, CFG_U_MIN
+RCALL LOAD_DIGIT
+SBI PORTC, PC3
+CFG_SKIP_3:
+RCALL SMALL_DELAY
+
+RJMP LOOP                ; Vuelve al inicio del bucle infinito
+
+;=========================
+; DISPLAY MODO NORMAL (Multiplexación tradicional de 4 dígitos)
+;=========================
+DISPLAY:
+RCALL APAGAR             ; Borra el dígito anterior
+MOV R16,R20              ; Carga decenas de hora/día
+RCALL LOAD_DIGIT         ; Envía segmentos al PORTB
+SBI PORTC,PC0            ; Enciende el pin común del primer display
+RCALL SMALL_DELAY        ; Pausa para brillo
+
+RCALL APAGAR
+MOV R16,R21              ; Carga unidades de hora/día
+RCALL LOAD_DIGIT
+SBI PORTC,PC1            ; Enciende el segundo display
+RCALL SMALL_DELAY
+
+RCALL APAGAR
+MOV R16,R22              ; Carga decenas de minuto/mes
+RCALL LOAD_DIGIT
+SBI PORTC,PC2            ; Enciende el tercer display
+RCALL SMALL_DELAY
+
+RCALL APAGAR
+MOV R16,R23              ; Carga unidades de minuto/mes
+RCALL LOAD_DIGIT
+SBI PORTC,PC3            ; Enciende el cuarto display
+RCALL SMALL_DELAY
+
+RJMP LOOP                ; Repite todo infinitamente (ilusión óptica de fijeza)
+
+;=========================
+; RUTINAS DE CONVERSIÓN PARA EDICIÓN
+;=========================
+; Separa la variable cruda (ej. Hora=15) en variables de edición (D_HOR=1, U_HOR=5)
+SPLIT_TIME_TO_CFG:
+LDS R17, STATE
+CPI R17, STATE_ALARM
+BREQ SPLIT_ALARM_VARS    ; Si es modo alarma, desglosa la alarma
+CPI R17, STATE_DATE
+BREQ SPLIT_DATE_VARS     ; Si es modo fecha, desglosa la fecha
+
+; Desglosar tiempo real
+LDS R16, HORAS
+RCALL DIV10              ; Llama a la rutina de división
+STS CFG_D_HOR, R18       ; Guarda el cociente (decenas)
+STS CFG_U_HOR, R19       ; Guarda el residuo (unidades)
+LDS R16, MINUTOS
+RCALL DIV10
+STS CFG_D_MIN, R18
+STS CFG_U_MIN, R19
+RET
+
+SPLIT_ALARM_VARS:
+; Desglosar variables de alarma
+LDS R16, ALARM_H
+RCALL DIV10
+STS CFG_D_HOR, R18
+STS CFG_U_HOR, R19
+LDS R16, ALARM_M
+RCALL DIV10
+STS CFG_D_MIN, R18
+STS CFG_U_MIN, R19
+RET
+
+SPLIT_DATE_VARS:
+; Desglosar variables de fecha
+LDS R16, DIA
+RCALL DIV10
+STS CFG_D_HOR, R18
+STS CFG_U_HOR, R19
+LDS R16, MES
+RCALL DIV10
+STS CFG_D_MIN, R18
+STS CFG_U_MIN, R19
+RET
+
+;--------------------------
+; Une las variables editadas (ej. D=1, U=5) de vuelta en variables crudas (15) al guardar
+MERGE_CFG_TO_TIME:
+; Algoritmo: (Decenas * 10) + Unidades
+LDS R16, CFG_D_HOR       ; Carga decenas
+LDI R17, 10
+MUL R16, R17             ; Multiplica por 10 (Resultado en R0)
+MOV R16, R0              ; Pasa resultado a R16
+LDS R17, CFG_U_HOR
+ADD R16, R17             ; Suma las unidades
+PUSH R16                 ; Guarda el resultado ensamblado en la pila (Stack)
+
+LDS R16, CFG_D_MIN
+LDI R17, 10
+MUL R16, R17
+MOV R16, R0
+LDS R17, CFG_U_MIN
+ADD R16, R17
+PUSH R16                 ; Guarda el segundo resultado en la pila
+CLR R1                   ; Limpia R1 (Regla estricta tras usar MUL en AVR)
+
+LDS R17, STATE
+CPI R17, STATE_ALARM
+BREQ MERGE_ALARM_VARS    ; Si estaba en alarma, va a guardarlo en memoria de alarma
+CPI R17, STATE_DATE
+BREQ MERGE_DATE_VARS     ; Si estaba en fecha, va a guardarlo en memoria de fecha
+
+; Guardar en tiempo real
+POP R16         
+STS MINUTOS, R16         ; Recupera minutos de la pila (LIFO - Último en entrar, primero en salir)
+POP R16         
+STS HORAS, R16           ; Recupera horas de la pila
+RET
+
+MERGE_ALARM_VARS:
+POP R16         
+STS ALARM_M, R16
+POP R16         
+STS ALARM_H, R16
+CLR R16
+STS ALARM_LAST_MINUTE, R16 ; Resetea el gatillo por si se modificó para que suene enseguida
+RET
+
+MERGE_DATE_VARS:
+; Protección de Fecha: Evitar que el usuario guarde Día 0 o Mes 0
+POP R16         
+TST R16                  ; Prueba si el mes es 0
+BRNE M_SAVE_MES          ; Si no es cero, salta para guardar
+LDI R16, 1               ; Si es cero, lo fuerza a ser 1
+M_SAVE_MES:
+STS MES, R16
+
+POP R16         
+TST R16                  ; Prueba si el día es 0
+BRNE M_SAVE_DIA
+LDI R16, 1               ; Si es cero, lo fuerza a ser 1
+M_SAVE_DIA:
+STS DIA, R16
+RET
+
+;=========================
+; SUBRUTINAS DE APOYO
+;=========================
+; Divide un número en R16 entre 10 mediante restas sucesivas
+DIV10:
+CLR R18                  ; R18 será el cociente (decenas)
+DIV_LOOP:
+CPI R16,10               ; Compara si el número es menor a 10
+BRLO DONE_DIV            ; Si es menor, terminó la división
+SUBI R16,10              ; Resta 10 al número
+INC R18                  ; Incrementa el cociente
+RJMP DIV_LOOP            ; Repite el ciclo
+DONE_DIV:
+MOV R19,R16              ; Lo que sobra (residuo) son las unidades, se guardan en R19
+RET
+
+; Apaga todos los transistores y segmentos para evitar cruce de luces (Ghosting)
+APAGAR:
+IN R16, PORTC
+ANDI R16, 0b11110000     ; Apaga pines PC0-PC3 sin alterar PC4 y PC5 (LEDs indicadores)
+OUT PORTC, R16
+CLR R16
+OUT PORTB, R16           ; Apaga los segmentos A-F
+CBI PORTD, PD7           ; Apaga el segmento G
+NOP                      ; Pausas de 1 ciclo de reloj para asegurar que la corriente caiga a 0
+NOP
+NOP
+NOP
+NOP
+RET
+
+; Genera un retardo muy corto para la persistencia visual de los displays multiplexados
+SMALL_DELAY:
+LDI R18,40               ; Carga contador en 40
+DLY1:
+DEC R18                  ; Decrementa 
+BRNE DLY1                ; Repite hasta llegar a cero
+RET
+
+; Decodificador: Convierte un número decimal (R16) al patrón de bits del Display 7 Segmentos
+LOAD_DIGIT:
+CPI R16,0
+BREQ D0
+CPI R16,1
+BREQ D1
+CPI R16,2
+BREQ D2
+CPI R16,3
+BREQ D3
+CPI R16,4
+BREQ D4
+CPI R16,5
+BREQ D5
+CPI R16,6
+BREQ D6
+CPI R16,7
+BREQ D7
+CPI R16,8
+BREQ D8
+RJMP D9
+
+; Mapeo binario (Segmentos F-E-D-C-B-A) en PORTB y (G) en PD7
+D0: LDI R17,0b00111111
+RJMP SEND
+D1: LDI R17,0b00000110
+RJMP SEND
+D2: LDI R17,0b01011011
+RJMP SEND
+D3: LDI R17,0b01001111
+RJMP SEND
+D4: LDI R17,0b01100110
+RJMP SEND
+D5: LDI R17,0b01101101
+RJMP SEND
+D6: LDI R17,0b01111101
+RJMP SEND
+D7: LDI R17,0b00000111
+RJMP SEND
+D8: LDI R17,0b01111111
+RJMP SEND
+D9: LDI R17,0b01101111
+SEND:
+MOV R18,R17
+ANDI R18,0b00111111     ; Extrae solo los 6 bits inferiores para mandarlos al PORTB
+OUT PORTB,R18
+SBRS R17,6              ; Revisa el 7mo bit (Segmento G)
+CBI PORTD,PD7           ; Si es 0, apaga PD7
+SBRC R17,6
+SBI PORTD,PD7           ; Si es 1, enciende PD7
+RET
+
+;=========================
+; CALENDARIO (Avanza la fecha a medianoche)
+;=========================
+NEXT_DAY:
+LDS R16,DIA              ; Carga el día actual
+INC R16                  ; Suma 1 al día
+LDS R17,MES              ; Carga el mes actual
+
+CPI R17,2                ; ¿Es Febrero?
+BREQ FEB_CHECK
+CPI R17,4                ; ¿Es Abril?
+BREQ MONTH30
+CPI R17,6                ; ¿Es Junio?
+BREQ MONTH30
+CPI R17,9                ; ¿Es Septiembre?
+BREQ MONTH30
+CPI R17,11               ; ¿Es Noviembre?
+BREQ MONTH30
+
+; Si no fue ninguno anterior, es un mes de 31 días
+CPI R16,32               ; Comprueba si el día llegó a 32
+BRLO SAVE_DAY            ; Si es menor a 32, guarda el día normal
+RJMP NEW_MONTH           ; Si es 32, hace el cambio de mes
+
+MONTH30:                 ; Regla para meses de 30 días
+CPI R16,31
+BRLO SAVE_DAY
+RJMP NEW_MONTH
+
+FEB_CHECK:               ; Regla para Febrero (Año no bisiesto por defecto = 28 días)
+CPI R16,29
+BRLO SAVE_DAY
+RJMP NEW_MONTH
+
+SAVE_DAY:
+STS DIA,R16              ; Guarda el día calculado y sale
+RET
+
+NEW_MONTH:
+LDI R16,1                ; Resetea el día a 1
+STS DIA,R16
+LDS R17,MES
+INC R17                  ; Suma 1 al mes
+CPI R17,13               ; Comprueba si el mes llegó a 13
+BRLO SAVE_MONTH          ; Si es menor, guarda normal
+LDI R17,1                ; Si llegó a 13, resetea a Enero (1)
+SAVE_MONTH:
+STS MES,R17
+RET
+
+;=========================
+; CHECK_ALARM (Revisa si debe sonar el buzzer)
+;=========================
+CHECK_ALARM:
+LDS R16, HORAS
+LDS R17, ALARM_H
+CP R16, R17
+BRNE NOT_ALARM_TIME      ; Si las horas no coinciden, rearma y sale
+
+LDS R16, MINUTOS
+LDS R17, ALARM_M
+CP R16, R17
+BRNE NOT_ALARM_TIME      ; Si los minutos no coinciden, rearma y sale
+
+; Las horas y minutos coinciden. Revisa si ya sonó hace un segundo.
+LDS R16, MINUTOS
+LDS R17, ALARM_LAST_MINUTE
+CP R16, R17
+BREQ END_ALARM_CHECK     ; Si ya sonó, no activa la bandera para no saturar
+
+; Activar el Buzzer
+LDI R16, 1
+STS ALARM_ON, R16        ; Activa bandera de Alarma Sonando
+LDS R16, MINUTOS
+STS ALARM_LAST_MINUTE, R16 ; Guarda este minuto para no repetirlo
+RJMP END_ALARM_CHECK     
+
+NOT_ALARM_TIME:
+; Rearma la alarma guardando un minuto irreal (255)
+LDI R16, 0xFF            
+STS ALARM_LAST_MINUTE, R16
+
+END_ALARM_CHECK:
+RET
+
+;=========================
+; ISR BOTONES (Interrupción de Pin Change)
+;=========================
+ISR_PCINT2:
+; Salvar registros usados en la pila para no afectar el bucle principal
+PUSH R16
+PUSH R17
+PUSH R18
+
+LDS R16,BTN_LOCK         ; Leer si los botones están bloqueados por antirrebote
+CPI R16,1
+; --- TRAMPOLÍN ---
+BRNE CONTINUE_PCINT2  ; Si no están bloqueados, continúa normalmente
+RJMP EXIT_BTN         ; Si están bloqueados, salta hasta el final (RJMP largo)
+CONTINUE_PCINT2:
+; -----------------
+
+IN R16,PIND              ; Lee el estado físico de los botones
+
+;-------------------------
+; Apagar alarma si suena
+;-------------------------
+LDS R17,ALARM_ON
+CPI R17,1
+BRNE CHECK_STATE_MODE    ; Si no está sonando, sigue a la lógica de botones
+
+CLR R17
+STS ALARM_ON,R17         ; Si estaba sonando, apaga la bandera
+CBI PORTD,PD5            ; Apaga el pin físico del buzzer
+RJMP SET_DEBOUNCE        ; Va directo al bloqueo de botón sin cambiar modos
+
+;-------------------------
+; Revisar en qué modo estamos
+;-------------------------
+CHECK_STATE_MODE:
+LDS R17, CONFIG_MODE
+CPI R17, 1
+BREQ IN_CONFIG_MODE      ; Si está en modo configuración (edición), divide la lógica
+
+; === LÓGICA DE BOTONES EN MODO NORMAL ===
+; 1. Botón MODE (PD4 - Pulsador NEXT)
+SBRC R16,PD4            
+RJMP CHECK_NORMAL_D2     ; Si no se pulsó, salta al siguiente botón
+RCALL MODE_PRESS         ; Si se pulsó, cambia el modo (Hora->Fecha->Alarma)
+RJMP SET_DEBOUNCE       
+
+CHECK_NORMAL_D2:
+; 2. Botón D2 - Iniciar Long Press
+LDS R17, STATE
+CPI R17, STATE_TIME
+BREQ ALLOW_HOLD          ; Permite pulsación larga en modo Reloj
+CPI R17, STATE_ALARM
+BREQ ALLOW_HOLD          ; Permite pulsación larga en modo Alarma
+CPI R17, STATE_DATE
+BREQ ALLOW_HOLD          ; Permite pulsación larga en modo Fecha
+RJMP SKIP_HOLD           ; Si por algún error no es ninguno, ignora
+
+ALLOW_HOLD:
+SBRC R16,PD2            
+RJMP SKIP_HOLD           ; Si no está presionado, ignora
+RCALL START_HOLD         ; Si está presionado, inicia cronómetro de 1 segundo
+
+SKIP_HOLD:
+RJMP SET_DEBOUNCE
+
+
+; === LÓGICA DE BOTONES EN MODO CONFIGURACIÓN (EDICIÓN) ===
+IN_CONFIG_MODE:
+
+; 1. Botón NEXT (PD4) - Avanza el cursor de dígito
+SBRC R16,PD4            
+RJMP CHECK_UP
+
+LDS R17, CONFIG_DIGIT
+INC R17                  ; Pasa al siguiente dígito
+CPI R17, 4               ; Si llega a 4 (ya pasó todos los dígitos)...
+BREQ EXIT_CFG            ; ...salta a salir de la configuración
+STS CONFIG_DIGIT, R17    ; Si no, guarda el nuevo dígito activo
+RJMP SET_DEBOUNCE       
+
+EXIT_CFG:
+RCALL MERGE_CFG_TO_TIME  ; Une las variables aisladas y las guarda en la RAM
+CLR R17
+STS CONFIG_MODE, R17     ; Apaga el modo edición
+STS CONFIG_DIGIT, R17    ; Resetea el cursor
+; Solo reiniciar segundos a cero si estábamos configurando la Hora
+LDS R17, STATE
+CPI R17, STATE_TIME
+BRNE SKIP_RESET_S
+CLR R17
+STS SEGUNDOS, R17
+SKIP_RESET_S:
+RJMP SET_DEBOUNCE
+
+; 2. Botón UP (PD2) - Incrementa números
+CHECK_UP:
+SBRC R16,PD2            
+RJMP CHECK_DOWN
+RCALL INC_CONFIG_VAL     ; Llama subrutina para subir valor
+RJMP SET_DEBOUNCE       
+
+; 3. Botón DOWN (PD3) - Decrementa números
+CHECK_DOWN:
+SBRC R16,PD3            
+RJMP SET_DEBOUNCE
+RCALL DEC_CONFIG_VAL     ; Llama subrutina para bajar valor
+
+; Aplica el bloqueo de seguridad (Antirrebote y ráfaga)
+SET_DEBOUNCE:
+LDI R16,1
+STS BTN_LOCK,R16         ; Activa el bloqueo
+LDI R16,150              ; Carga tiempo de espera (150 ciclos del Timer)
+STS BTN_TIMER,R16
+
+EXIT_BTN:
+POP R18                  ; Restaura registros usados y sale
+POP R17
+POP R16
+RETI
+
+; --- Rutina Inicio Long Press ---
+START_HOLD:
+LDI R17, 1
+STS HOLD_FLAG, R17       ; Activa bandera que el botón está siendo retenido
+CLR R17
+STS HOLD_L, R17          ; Resetea el cronómetro a 0
+STS HOLD_H, R17
+RET
+
+;================================================
+; --- INCREMENTAR VALORES CONFIG ---
+;================================================
+INC_CONFIG_VAL:
+LDS R17, STATE
+CPI R17, STATE_DATE
+BRNE CONTINUE_INC_TIME
+RJMP INC_DATE_VAL        ; Salto largo si estamos incrementando una fecha
+CONTINUE_INC_TIME:
+
+; Lógica incremental para Tiempo y Alarma
+LDS R17, CONFIG_DIGIT
+CPI R17, 0
+BREQ INC_D_HOR           ; Salta a rutina de +1 Decena Hora
+CPI R17, 1
+BREQ INC_U_HOR           ; Salta a rutina de +1 Unidad Hora
+CPI R17, 2
+BREQ INC_D_MIN           ; Salta a rutina de +1 Decena Minuto
+CPI R17, 3
+BREQ INC_U_MIN           ; Salta a rutina de +1 Unidad Minuto
+RET
+
+; Rutinas de desbordamiento (Overflow): Si llega al tope, vuelve a cero.
+INC_D_HOR:
+LDS R16, CFG_D_HOR
+INC R16
+CPI R16, 3               ; Límite de decenas de hora: 0, 1, 2
+BRNE SAVE_D_HOR
+CLR R16
+SAVE_D_HOR:
+STS CFG_D_HOR, R16
+CPI R16, 2               ; Ajuste de seguridad: si Decena pasó a 2...
+BRNE RET_INC
+LDS R17, CFG_U_HOR
+CPI R17, 4               ; ...y la unidad era mayor a 3 (Ej. era 19 y subió a 29)...
+BRLO RET_INC
+LDI R17, 3               ; ...fuerza la unidad a 3 (para que quede en 23 máximo).
+STS CFG_U_HOR, R17
+RET_INC:
+RET
+
+INC_U_HOR:
+LDS R16, CFG_U_HOR
+INC R16
+LDS R17, CFG_D_HOR
+CPI R17, 2               ; Revisa la decena para saber el límite de la unidad
+BREQ MAX_U_HOR_3
+CPI R16, 10              ; Si la decena es 0 o 1, la unidad va de 0 a 9
+BRNE SAVE_U_HOR
+CLR R16
+RJMP SAVE_U_HOR
+MAX_U_HOR_3:
+CPI R16, 4               ; Si la decena es 2, la unidad va de 0 a 3
+BRNE SAVE_U_HOR
+CLR R16
+SAVE_U_HOR:
+STS CFG_U_HOR, R16
+RET
+
+INC_D_MIN:
+LDS R16, CFG_D_MIN
+INC R16
+CPI R16, 6               ; Decenas de minutos van de 0 a 5
+BRNE SAVE_D_MIN
+CLR R16
+SAVE_D_MIN:
+STS CFG_D_MIN, R16
+RET
+
+INC_U_MIN:
+LDS R16, CFG_U_MIN
+INC R16
+CPI R16, 10              ; Unidades de minutos van de 0 a 9
+BRNE SAVE_U_MIN
+CLR R16
+SAVE_U_MIN:
+STS CFG_U_MIN, R16
+RET
+
+; Lógica incremental para Fecha (Días y Meses)
+INC_DATE_VAL:
+LDS R17, CONFIG_DIGIT
+CPI R17, 0
+BREQ INC_D_DIA
+CPI R17, 1
+BREQ INC_U_DIA
+CPI R17, 2
+BREQ INC_D_MES
+CPI R17, 3
+BREQ INC_U_MES
+RET
+
+; Se aplican topes similares, Día llega a 31 máximo y Mes a 12
+INC_D_DIA:
+LDS R16, CFG_D_HOR       ; Usamos CFG_D_HOR para almacenar las decenas del día temporalmente
+INC R16
+CPI R16, 4               ; Tope: 3 decenas de día
+BRNE SAVE_D_DIA
+CLR R16
+SAVE_D_DIA:
+STS CFG_D_HOR, R16
+CPI R16, 3
+BRNE RET_INC_DD
+LDS R17, CFG_U_HOR
+CPI R17, 2
+BRLO RET_INC_DD
+LDI R17, 1               ; Si pasó a 3 y la unidad era >1, fuerza a 31
+STS CFG_U_HOR, R17
+RET_INC_DD:
+RET
+
+INC_U_DIA:
+LDS R16, CFG_U_HOR
+INC R16
+LDS R17, CFG_D_HOR
+CPI R17, 3
+BREQ MAX_UD_1
+CPI R16, 10
+BRNE SAVE_U_DIA
+CLR R16
+RJMP SAVE_U_DIA
+MAX_UD_1:
+CPI R16, 2               ; Si la decena es 3, el tope de unidad es 1 (Día 31)
+BRNE SAVE_U_DIA
+CLR R16
+SAVE_U_DIA:
+STS CFG_U_HOR, R16
+RET
+
+INC_D_MES:
+LDS R16, CFG_D_MIN       ; Usamos CFG_D_MIN para las decenas del Mes
+INC R16
+CPI R16, 2               ; Meses van hasta el 12 (decena max = 1)
+BRNE SAVE_D_MES
+CLR R16
+SAVE_D_MES:
+STS CFG_D_MIN, R16
+CPI R16, 1
+BRNE RET_INC_DM
+LDS R17, CFG_U_MIN
+CPI R17, 3
+BRLO RET_INC_DM
+LDI R17, 2               ; Si subió a mes 10 y unidad era >2, lo fuerza a mes 12
+STS CFG_U_MIN, R17
+RET_INC_DM:
+RET
+
+INC_U_MES:
+LDS R16, CFG_U_MIN
+INC R16
+LDS R17, CFG_D_MIN
+CPI R17, 1
+BREQ MAX_UM_2
+CPI R16, 10
+BRNE SAVE_U_MES
+CLR R16
+RJMP SAVE_U_MES
+MAX_UM_2:
+CPI R16, 3               ; Si decena es 1, tope es 2 (Mes 12)
+BRNE SAVE_U_MES
+CLR R16
+SAVE_U_MES:
+STS CFG_U_MIN, R16
+RET
+
+;================================================
+; --- DECREMENTAR VALORES CONFIG ---
+;================================================
+DEC_CONFIG_VAL:
+LDS R17, STATE
+CPI R17, STATE_DATE
+BREQ DEC_DATE_VAL        ; Salto a decremento de fecha
+
+; Lógica decremento para Time y Alarm
+LDS R17, CONFIG_DIGIT
+CPI R17, 0
+BREQ DEC_D_HOR
+CPI R17, 1
+BREQ DEC_U_HOR
+CPI R17, 2
+BREQ DEC_D_MIN
+CPI R17, 3
+BREQ DEC_U_MIN
+RET
+
+; Subrutinas "Underflow": Si baja de cero, hace ciclo completo al tope máximo.
+DEC_D_HOR:
+LDS R16, CFG_D_HOR
+DEC R16
+BRPL SAVE_DEC_DH         ; Si es Positivo o Cero, guarda
+LDI R16, 2               ; Si es Negativo, vuelve a 2
+SAVE_DEC_DH:
+STS CFG_D_HOR, R16
+CPI R16, 2
+BRNE RET_DEC
+LDS R17, CFG_U_HOR
+CPI R17, 4
+BRLO RET_DEC
+LDI R17, 3               ; Ajuste de seguridad para no quedar en 29 al bajar
+STS CFG_U_HOR, R17
+RET_DEC:
+RET
+
+DEC_U_HOR:
+LDS R16, CFG_U_HOR
+DEC R16
+BRPL SAVE_DEC_UH
+LDS R17, CFG_D_HOR
+CPI R17, 2
+BREQ WRAP_UH_3
+LDI R16, 9               ; Bajo a 9 si decena es 0 o 1
+RJMP SAVE_DEC_UH
+WRAP_UH_3:
+LDI R16, 3               ; Bajo a 3 si decena es 2
+SAVE_DEC_UH:
+STS CFG_U_HOR, R16
+RET
+
+DEC_D_MIN:
+LDS R16, CFG_D_MIN
+DEC R16
+BRPL SAVE_DEC_DM
+LDI R16, 5               ; Tope decenas minuto
+SAVE_DEC_DM:
+STS CFG_D_MIN, R16
+RET
+
+DEC_U_MIN:
+LDS R16, CFG_U_MIN
+DEC R16
+BRPL SAVE_DEC_UM
+LDI R16, 9               ; Tope unidades minuto
+SAVE_DEC_UM:
+STS CFG_U_MIN, R16
+RET
+
+; Lógica decremento para Fecha (Días y Meses)
+DEC_DATE_VAL:
+LDS R17, CONFIG_DIGIT
+CPI R17, 0
+BREQ DEC_D_DIA
+CPI R17, 1
+BREQ DEC_U_DIA
+CPI R17, 2
+BREQ DEC_D_MES
+CPI R17, 3
+BREQ DEC_U_MES
+RET
+
+DEC_D_DIA:
+LDS R16, CFG_D_HOR
+DEC R16
+BRPL SAVE_DEC_DD
+LDI R16, 3
+SAVE_DEC_DD:
+STS CFG_D_HOR, R16
+CPI R16, 3
+BRNE RET_DEC_DD
+LDS R17, CFG_U_HOR
+CPI R17, 2
+BRLO RET_DEC_DD
+LDI R17, 1
+STS CFG_U_HOR, R17
+RET_DEC_DD:
+RET
+
+DEC_U_DIA:
+LDS R16, CFG_U_HOR
+DEC R16
+BRPL SAVE_DEC_UD
+LDS R17, CFG_D_HOR
+CPI R17, 3
+BREQ WRAP_UD_1
+LDI R16, 9
+RJMP SAVE_DEC_UD
+WRAP_UD_1:
+LDI R16, 1
+SAVE_DEC_UD:
+STS CFG_U_HOR, R16
+RET
+
+DEC_D_MES:
+LDS R16, CFG_D_MIN
+DEC R16
+BRPL SAVE_DEC_DMES     
+LDI R16, 1               ; Meses: Tope al bajar es mes 10 (decena=1)
+SAVE_DEC_DMES:         
+STS CFG_D_MIN, R16
+CPI R16, 1
+BRNE RET_DEC_DMES      
+LDS R17, CFG_U_MIN
+CPI R17, 3
+BRLO RET_DEC_DMES      
+LDI R17, 2
+STS CFG_U_MIN, R17
+RET_DEC_DMES:           
+RET
+
+DEC_U_MES:
+LDS R16, CFG_U_MIN
+DEC R16
+BRPL SAVE_DEC_UMES     
+LDS R17, CFG_D_MIN
+CPI R17, 1
+BREQ WRAP_UM_2
+LDI R16, 9               ; Baja a 9 si decena es 0
+RJMP SAVE_DEC_UMES     
+WRAP_UM_2:
+LDI R16, 2               ; Baja a 2 si decena es 1
+SAVE_DEC_UMES:         
+STS CFG_U_MIN, R16
+RET
+
+;------------------------------------------------
+; Cambia la máquina de estados ciclando de 0 a 2
+MODE_PRESS:
+LDS R16,STATE
+INC R16
+CPI R16,3                ; Si llega a 3, desborda
+BRLO SAVE_STATE
+CLR R16                  ; Vuelve a estado 0
+SAVE_STATE:
+STS STATE,R16
+RET
+
+;=========================
+; ISR TIMER0 (El Corazón del Reloj)
+;=========================
+ISR_TIMER0:
+; Esta interrupción salta cada 1 milisegundo (o valor seteado). 
+; Es vital proteger TODOS los registros que se usen aquí.
+PUSH R16
+PUSH R24
+PUSH R25
+PUSH R18
+PUSH R19
+
+; Incrementar variables de milisegundos (Rápida base de tiempo)
+LDS R24,MS_L
+LDS R25,MS_H
+ADIW R24,1               ; Sumar 1 a la variable doble de 16-bits
+STS MS_L,R24
+STS MS_H,R25
+
+; Incrementar variables para el parpadeo
+LDS R24,HALF_L
+LDS R25,HALF_H
+ADIW R24,1
+STS HALF_L,R24
+STS HALF_H,R25
+
+CPI R24,LOW(500)         ; Compara si el contador llegó a 500ms
+LDI R18,HIGH(500)
+CPC R25,R18              ; Compare with carry para valores 16-bits
+BRNE CHECK_HOLD
+
+; Si pasó medio segundo, resetea el contador de parpadeo a 0
+CLR R24
+CLR R25
+STS HALF_L,R24
+STS HALF_H,R25
+
+; Y cambia el estado (Toggle) de la bandera de los dos puntos
+LDS R18,COLON_FLAG
+LDI R19,1
+EOR R18,R19              ; XOR lógico: Si es 1 pasa a 0, si es 0 pasa a 1.
+STS COLON_FLAG,R18
+
+;-------------------------
+; Lógica de LONG PRESS (D2) controlada desde el Timer para ignorar rebotes
+;-------------------------
+CHECK_HOLD:
+LDS R18, HOLD_FLAG       ; ¿Está activo el cronómetro del botón presionado?
+CPI R18, 1
+BRNE CHECK_SEC
+
+; Verificar físicamente si soltó el botón
+SBIC PIND, PD2
+RJMP CANCEL_HOLD 
+
+; Si sigue presionado, incrementar contador del cronómetro
+LDS R24, HOLD_L
+LDS R25, HOLD_H
+ADIW R24, 1
+STS HOLD_L, R24
+STS HOLD_H, R25
+
+; Comparar si ya llegó a 1000 iteraciones (equivalente a 1 segundo aquí)
+CPI R24, LOW(1000)
+LDI R18, HIGH(1000)
+CPC R25, R18
+BRNE CHECK_SEC
+
+; ¡Éxito! Alcanzó 1 segundo retenido. Preparar variables aisladas.
+RCALL SPLIT_TIME_TO_CFG
+LDI R18, 1
+STS CONFIG_MODE, R18     ; Activar modo configuración
+CLR R18
+STS CONFIG_DIGIT, R18    ; Resetear cursor a la posición cero
+
+CANCEL_HOLD:
+CLR R18
+STS HOLD_FLAG, R18       ; Cancelar el cronómetro o reiniciarlo
+
+CHECK_SEC:
+; ---------------------------------
+; Decrementar Antirrebote (Debounce)
+; ---------------------------------
+LDS R16,BTN_TIMER
+CPI R16,0
+BREQ END_DEBOUNCE        ; Si es cero, el filtro ya terminó
+DEC R16
+STS BTN_TIMER,R16
+BRNE END_DEBOUNCE        ; Si no es cero aún, sigue esperando
+CLR R16
+STS BTN_LOCK,R16         ; Al llegar a cero, desbloquea los botones
+
+END_DEBOUNCE:
+LDS R24,MS_L
+LDS R25,MS_H
+
+; ---------------------------------
+; Revisar paso de Segundos reales
+; ---------------------------------
+; (Nota: Aquí está ajustado a 1 tick para pruebas rápidas. 
+; Para reloj real, cambiar a 1000).
+CPI R24,LOW(1)
+LDI R18,HIGH(1)
+CPC R25,R18
+BREQ CONTINUE_ISR        ; Si pasó un "segundo", continúa la rutina
+RJMP END_ISR             ; Si no, sale
+
+CONTINUE_ISR:
+; Resetea el contador de milisegundos
+CLR R24
+CLR R25
+STS MS_L,R24
+STS MS_H,R25
+
+; --- EXCEPCIÓN: NO AVANZAR RELOJ SI CONFIGURAMOS LA HORA ---
+LDS R16, CONFIG_MODE
+CPI R16, 1
+BRNE CONTINUE_TIME       ; Si no estamos en config, sigue normal
+LDS R17, STATE
+CPI R17, STATE_TIME
+BREQ END_ISR             ; Solo congela el reloj si estamos editando la HORA
+
+CONTINUE_TIME:
+; Algoritmo de Avance del Reloj
+LDS R18,SEGUNDOS
+INC R18
+CPI R18,60               ; Compara si llegó a 60 Segundos
+BRLO SAVE_S
+CLR R18
+
+LDS R24,MINUTOS
+INC R24
+CPI R24,60               ; Compara si llegó a 60 Minutos
+BRLO SAVE_M
+CLR R24
+
+LDS R25,HORAS
+INC R25
+CPI R25,24               ; Compara si llegó a 24 Horas
+BRLO SAVE_H
+
+CLR R25                  ; Medianoche: Hora = 0
+RCALL NEXT_DAY           ; Al cruzar la medianoche, avanza el calendario
+
+SAVE_H:
+STS HORAS,R25
+SAVE_M:
+STS MINUTOS,R24
+SAVE_S:
+STS SEGUNDOS,R18
+RCALL CHECK_ALARM        ; Cada "segundo" que pasa, verifica si es la hora de la alarma
+
+END_ISR:
+POP R19                  ; Restaura registros originales y sale
+POP R18
+POP R25
+POP R24
+POP R16
+RETI                     ; Retorno de interrupción
